@@ -7,6 +7,14 @@
 #include "fpmsyncd/routesync.h"
 #undef private
 
+#include <arpa/inet.h>
+#include <linux/rtnetlink.h>
+#include <netlink/route/link.h>
+#include <netlink/route/nexthop.h>
+#include <linux/nexthop.h>
+
+#include <sstream>
+
 using namespace swss;
 #define MAX_PAYLOAD 1024
 
@@ -26,6 +34,8 @@ public:
                                rtattr *[], std::string&,
                                std::string& , std::string&,
                                std::string&), (override));
+    MOCK_METHOD(bool, getIfName, (int, char *, size_t), (override));
+    MOCK_METHOD(void, onNextHopMsg, (struct nlmsghdr *, int), (override));
 };
 class MockFpm : public FpmInterface
 {
@@ -222,6 +232,7 @@ TEST_F(FpmSyncdResponseTest, testEvpn)
         return true;
     });
     m_mockRouteSync.onMsgRaw(nlh);
+    
     vector<string> keys;
     vector<FieldValueTuple> fieldValues;
     app_route_table.getKeys(keys);
@@ -231,4 +242,63 @@ TEST_F(FpmSyncdResponseTest, testEvpn)
     auto value = swss::fvsGetValue(fieldValues, "protocol", true);
     ASSERT_EQ(value.get(), "0xc8");
 
+}
+
+TEST_F(FpmSyncdResponseTest, testNewNextHopMsg)
+{
+    struct nlmsghdr *nlh = (struct nlmsghdr *)malloc(NLMSG_SPACE(MAX_PAYLOAD));
+    memset(nlh, 0, NLMSG_SPACE(MAX_PAYLOAD));
+    nlh->nlmsg_type = RTM_NEWNEXTHOP;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE;
+
+    struct nhmsg *nhm = (struct nhmsg *)NLMSG_DATA(nlh);
+    nhm->nh_family = AF_INET;
+    struct rtattr *rta = (struct rtattr *)((char *)nlh + NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+    uint32_t test_id = 10;
+    const char* test_gateway = "192.168.1.1";
+    int32_t test_ifindex = 5;
+
+    rta->rta_type = NHA_ID;
+    rta->rta_len = RTA_LENGTH(sizeof(uint32_t));
+    memcpy(RTA_DATA(rta), &test_id, sizeof(uint32_t));
+    rta = (struct rtattr *)((char *)rta + RTA_ALIGN(rta->rta_len));
+
+    struct in_addr gw_addr;
+    inet_pton(AF_INET, test_gateway, &gw_addr);
+    rta->rta_type = NHA_GATEWAY;
+    rta->rta_len = RTA_LENGTH(sizeof(struct in_addr));
+    memcpy(RTA_DATA(rta), &gw_addr, sizeof(struct in_addr));
+    rta = (struct rtattr *)((char *)rta + RTA_ALIGN(rta->rta_len));
+
+    rta->rta_type = NHA_OIF;
+    rta->rta_len = RTA_LENGTH(sizeof(int32_t));
+    memcpy(RTA_DATA(rta), &test_ifindex, sizeof(int32_t));
+    rta = (struct rtattr *)((char *)rta + RTA_ALIGN(rta->rta_len));
+
+    nlh->nlmsg_len = NLMSG_SPACE(MAX_PAYLOAD);
+
+    int len = (int)(NLMSG_SPACE(MAX_PAYLOAD) - NLMSG_LENGTH(sizeof(struct nhmsg)));
+
+    EXPECT_CALL(m_mockRouteSync, onNextHopMsg(nlh, len))
+        .Times(1)
+        .WillOnce([&](struct nlmsghdr *h, int actuallen)-> void {
+            std::cout << "onNextHopMsg is invoked!" << std::endl;
+            EXPECT_EQ(actuallen, len);
+            return;
+        });
+
+    m_mockRouteSync.onMsgRaw(nlh);
+
+    auto it = m_mockRouteSync.m_nh_groups.find(test_id);
+    if (it == m_mockRouteSync.m_nh_groups.end())
+    {
+        std::cout << "fail to add new nh" << std::endl;
+    }
+
+    // EXPECT_EQ(it->second.id, test_id);
+    // EXPECT_EQ(it->second.nexthop, "192.168.1.1");
+    // EXPECT_EQ(it->second.intf, "Ethernet0");
+
+    free(nlh);
 }
